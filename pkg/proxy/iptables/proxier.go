@@ -160,6 +160,7 @@ type Proxier struct {
 	// These are effectively const and do not need the mutex to be held.
 	syncPeriod     time.Duration
 	iptables       utiliptables.Interface
+	ignoreFilter   bool
 	masqueradeAll  bool
 	masqueradeMark string
 	exec           utilexec.Interface
@@ -171,6 +172,11 @@ type localPort struct {
 	ip       string
 	port     int
 	protocol string
+}
+
+type tableChainType struct {
+	table utiliptables.Table
+	chain utiliptables.Chain
 }
 
 func (lp *localPort) String() string {
@@ -189,7 +195,7 @@ var _ proxy.ProxyProvider = &Proxier{}
 // An error will be returned if iptables fails to update or acquire the initial lock.
 // Once a proxier is created, it will keep iptables up to date in the background and
 // will not terminate if a particular iptables call fails.
-func NewProxier(ipt utiliptables.Interface, exec utilexec.Interface, syncPeriod time.Duration, masqueradeAll bool, masqueradeBit int, clusterCIDR string) (*Proxier, error) {
+func NewProxier(ipt utiliptables.Interface, exec utilexec.Interface, syncPeriod time.Duration, ignoreFilter bool, masqueradeAll bool, masqueradeBit int, clusterCIDR string) (*Proxier, error) {
 	// Set the route_localnet sysctl we need for
 	if err := utilsysctl.SetSysctl(sysctlRouteLocalnet, 1); err != nil {
 		return nil, fmt.Errorf("can't set sysctl %s: %v", sysctlRouteLocalnet, err)
@@ -222,6 +228,7 @@ func NewProxier(ipt utiliptables.Interface, exec utilexec.Interface, syncPeriod 
 		portsMap:       make(map[localPort]closeable),
 		syncPeriod:     syncPeriod,
 		iptables:       ipt,
+		ignoreFilter:	ignoreFilter,
 		masqueradeAll:  masqueradeAll,
 		masqueradeMark: masqueradeMark,
 		exec:           exec,
@@ -231,20 +238,22 @@ func NewProxier(ipt utiliptables.Interface, exec utilexec.Interface, syncPeriod 
 
 // CleanupLeftovers removes all iptables rules and chains created by the Proxier
 // It returns true if an error was encountered. Errors are logged.
-func CleanupLeftovers(ipt utiliptables.Interface) (encounteredError bool) {
+func CleanupLeftovers(ipt utiliptables.Interface, ignoreFilter bool) (encounteredError bool) {
 	// Unlink the services chain.
 	args := []string{
 		"-m", "comment", "--comment", "kubernetes service portals",
 		"-j", string(kubeServicesChain),
 	}
-	tableChainsWithJumpServices := []struct {
-		table utiliptables.Table
-		chain utiliptables.Chain
-	}{
-		{utiliptables.TableFilter, utiliptables.ChainOutput},
+
+	tableChainsWithJumpServices := []tableChainType {
 		{utiliptables.TableNAT, utiliptables.ChainOutput},
 		{utiliptables.TableNAT, utiliptables.ChainPrerouting},
 	}
+
+	if !ignoreFilter {
+		tableChainsWithJumpServices = append(tableChainsWithJumpServices, tableChainType{utiliptables.TableFilter, utiliptables.ChainOutput})
+	}
+
 	for _, tc := range tableChainsWithJumpServices {
 		if err := ipt.DeleteRule(tc.table, tc.chain, args...); err != nil {
 			if !utiliptables.IsNotFoundError(err) {
@@ -300,7 +309,8 @@ func CleanupLeftovers(ipt utiliptables.Interface) (encounteredError bool) {
 			encounteredError = true
 		}
 	}
-	{
+
+	if !ignoreFilter {
 		filterBuf := bytes.NewBuffer(nil)
 		writeLine(filterBuf, "*filter")
 		writeLine(filterBuf, fmt.Sprintf(":%s - [0:0]", kubeServicesChain))
@@ -651,7 +661,17 @@ func (proxier *Proxier) syncProxyRules() {
 
 	// Create and link the kube services chain.
 	{
-		tablesNeedServicesChain := []utiliptables.Table{utiliptables.TableFilter, utiliptables.TableNAT}
+		tablesNeedServicesChain := []utiliptables.Table{utiliptables.TableNAT}
+		tableChainsNeedJumpServices := []tableChainType {
+			{utiliptables.TableNAT, utiliptables.ChainOutput},
+			{utiliptables.TableNAT, utiliptables.ChainPrerouting},
+		}
+
+		if !proxier.ignoreFilter {
+			tablesNeedServicesChain = append(tablesNeedServicesChain, utiliptables.TableFilter)
+			tableChainsNeedJumpServices = append(tableChainsNeedJumpServices, tableChainType{utiliptables.TableFilter, utiliptables.ChainOutput})
+		}
+
 		for _, table := range tablesNeedServicesChain {
 			if _, err := proxier.iptables.EnsureChain(table, kubeServicesChain); err != nil {
 				glog.Errorf("Failed to ensure that %s chain %s exists: %v", table, kubeServicesChain, err)
@@ -659,14 +679,6 @@ func (proxier *Proxier) syncProxyRules() {
 			}
 		}
 
-		tableChainsNeedJumpServices := []struct {
-			table utiliptables.Table
-			chain utiliptables.Chain
-		}{
-			{utiliptables.TableFilter, utiliptables.ChainOutput},
-			{utiliptables.TableNAT, utiliptables.ChainOutput},
-			{utiliptables.TableNAT, utiliptables.ChainPrerouting},
-		}
 		comment := "kubernetes service portals"
 		args := []string{"-m", "comment", "--comment", comment, "-j", string(kubeServicesChain)}
 		for _, tc := range tableChainsNeedJumpServices {
@@ -1020,7 +1032,13 @@ func (proxier *Proxier) syncProxyRules() {
 	// NOTE: NoFlushTables is used so we don't flush non-kubernetes chains in the table.
 	filterLines := append(filterChains.Bytes(), filterRules.Bytes()...)
 	natLines := append(natChains.Bytes(), natRules.Bytes()...)
-	lines := append(filterLines, natLines...)
+
+	lines := make([]byte, 0)
+	if !proxier.ignoreFilter {
+		lines = append(filterLines, natLines...)
+	} else {
+		lines = natLines
+	}
 
 	glog.V(3).Infof("Restoring iptables rules: %s", lines)
 	err = proxier.iptables.RestoreAll(lines, utiliptables.NoFlushTables, utiliptables.RestoreCounters)

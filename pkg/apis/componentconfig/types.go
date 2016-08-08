@@ -44,6 +44,8 @@ type KubeProxyConfiguration struct {
 	// kubeconfigPath is the path to the kubeconfig file with authorization information (the
 	// master location is set by the master flag).
 	KubeconfigPath string `json:"kubeconfigPath"`
+	// ignoreFilter tells kube-proxy to ignore FILTER table if using the pure iptables proxy mode.
+	IgnoreFilter bool `json:"ignoreFilter"`
 	// masqueradeAll tells kube-proxy to SNAT everything if using the pure iptables proxy mode.
 	MasqueradeAll bool `json:"masqueradeAll"`
 	// master is the address of the Kubernetes API server (overrides any value in kubeconfig)
